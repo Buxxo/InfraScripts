@@ -1,0 +1,639 @@
+<#
+.SYNOPSIS
+    HPE iLO hardware health check - iLO 2 / 3 / 4 / 5 / 6 / 7.
+
+.DESCRIPTION
+    Reads iLO IPs / hostnames from a .txt file next to the script and reports every
+    component that is not healthy (disks, logical drives, controllers, fans, PSUs,
+    NICs, memory, CPUs, temperatures, iLO itself, redundancy).
+
+    Method per host (automatic fallback):
+      1. Redfish            - iLO 4 (fw 2.30+), iLO 5, iLO 6, iLO 7
+      2. RIBCL over HTTPS   - iLO 3, iLO 4 (old fw), iLO 5/6
+      3. RIBCL raw TLS 443  - iLO 2
+
+    Self-signed / expired certificates are accepted per request only
+    (no global certificate bypass is left behind in the session).
+
+    TXT report (script folder): iLO_Health_YYMMDD.txt - same content as console, same-day rerun overwrites.
+
+    CSV output (in .\Reports next to the script):
+      iLO_Summary_<timestamp>.csv   one line per server
+      iLO_Issues_<timestamp>.csv    only degraded / failed components + connection errors
+      iLO_Detail_<timestamp>.csv    all components (only with -FullDetail)
+
+    Exit code: 0 = all healthy, 1 = degraded components found, 2 = connection/auth errors.
+
+.PARAMETER HostFile
+    Text file with one iLO IP/hostname per line. '#' = comment. Relative paths resolve to the script folder.
+
+.EXAMPLE
+    .\Check-iLOHealth.ps1
+.EXAMPLE
+    .\Check-iLOHealth.ps1 -HostFile dc2.txt -FullDetail
+#>
+[CmdletBinding()]
+param(
+    [string]$HostFile = 'ilo_hosts.txt',
+    [string]$UserName = 'Administrator',
+    [pscredential]$Credential,
+    [ValidateRange(5, 300)][int]$TimeoutSec = 20,
+    [switch]$FullDetail,
+    # Stop after N consecutive authentication failures (prevents mass account lockout)
+    [int]$MaxAuthFailures = 3
+)
+
+$ErrorActionPreference = 'Stop'
+
+# ----------------------------------------------------------------------------------
+# Config - statuses treated as healthy / informational (regex, case-insensitive)
+# ----------------------------------------------------------------------------------
+$script:OkRegex = '^(OK|Good.*|Normal|Not Installed|Not Present|NotPresent|Absent|N/?A|Not Applicable|' +
+                  'Unknown|Other|Redundant|Fully Redundant|Complete|Enabled|Disabled|Link Down|Spare|' +
+                  'GoodInUse|GoodPartiallyInUse|PresentSpare|PresentUnused|Unavailable|Yes|No)$'
+$script:CriticalRegex = 'critical|fail|error|dead'
+
+# ----------------------------------------------------------------------------------
+# Paths
+# ----------------------------------------------------------------------------------
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+if (-not [IO.Path]::IsPathRooted($HostFile)) { $HostFile = Join-Path $ScriptDir $HostFile }
+if (-not (Test-Path -LiteralPath $HostFile)) { throw "Host file not found: $HostFile" }
+
+$ReportDir = Join-Path $ScriptDir 'Reports'
+if (-not (Test-Path -LiteralPath $ReportDir)) { New-Item -ItemType Directory -Path $ReportDir | Out-Null }
+$Stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$TxtFile = Join-Path $ScriptDir ("iLO_Health_{0}.txt" -f (Get-Date -Format 'yyMMdd'))
+$script:TxtLines = New-Object System.Collections.Generic.List[string]
+
+# Writes to console (colored) and to the TXT report
+function Write-Out([string]$Text = '', [string]$Color = 'Gray') {
+    Write-Host $Text -ForegroundColor $Color
+    $script:TxtLines.Add($Text)
+}
+
+$Hosts = Get-Content -LiteralPath $HostFile |
+    ForEach-Object { ($_ -replace '#.*$', '').Trim() -replace '^https?://', '' -replace '/.*$', '' } |
+    Where-Object { $_ } | Select-Object -Unique
+if (-not $Hosts) { throw "No hosts in $HostFile" }
+
+# ----------------------------------------------------------------------------------
+# TLS - per-request trust callback (works in Windows PowerShell 5.1 and PowerShell 7)
+# ----------------------------------------------------------------------------------
+if (-not ('IloTlsTrust' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+public static class IloTlsTrust {
+    public static bool Accept(object s, X509Certificate c, X509Chain ch, SslPolicyErrors e) { return true; }
+    public static RemoteCertificateValidationCallback Callback {
+        get { return new RemoteCertificateValidationCallback(Accept); }
+    }
+}
+'@
+}
+try {
+    $proto = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
+    if ($PSVersionTable.PSEdition -eq 'Core' -and [enum]::GetNames([Net.SecurityProtocolType]) -contains 'Tls13') {
+        $proto = $proto -bor [Net.SecurityProtocolType]::Tls13
+    }
+    [Net.ServicePointManager]::SecurityProtocol = $proto
+} catch { Write-Verbose "Could not set SecurityProtocol: $_" }
+
+# ----------------------------------------------------------------------------------
+# Credentials (memory only, cleared at the end)
+# ----------------------------------------------------------------------------------
+if (-not $Credential) {
+    $sec = Read-Host -AsSecureString "Password for '$UserName'"
+    $Credential = New-Object System.Management.Automation.PSCredential($UserName, $sec)
+}
+$script:User = $Credential.UserName
+$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
+try   { $script:Pass = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+$script:BasicAuth = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("$($script:User):$($script:Pass)"))
+$script:TimeoutMs = $TimeoutSec * 1000
+
+# ----------------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------------
+function Get-FirstValue {
+    foreach ($a in $args) { if ($null -ne $a -and "$a".Trim() -ne '') { return $a } }
+    return $null
+}
+
+function New-AuthError([string]$Msg) { New-Object System.UnauthorizedAccessException($Msg) }
+
+function Test-IsAuthError($Err) {
+    $e = $Err.Exception
+    while ($e) { if ($e -is [System.UnauthorizedAccessException]) { return $true }; $e = $e.InnerException }
+    return $false
+}
+
+function Test-Tcp([string]$H, [int]$Port, [int]$Ms) {
+    $c = New-Object Net.Sockets.TcpClient
+    try {
+        $iar = $c.BeginConnect($H, $Port, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne($Ms)) { return $false }
+        $c.EndConnect($iar); return $true
+    } catch { return $false } finally { $c.Close() }
+}
+
+function Invoke-IloRequest {
+    param([string]$Uri, [string]$Method = 'GET', [string]$Body, [string]$ContentType = 'application/json', [switch]$NoAuth)
+    $req = [Net.HttpWebRequest]::Create($Uri)
+    $req.Method = $Method
+    $req.Timeout = $script:TimeoutMs
+    $req.ReadWriteTimeout = $script:TimeoutMs
+    $req.Proxy = $null
+    $req.ServerCertificateValidationCallback = [IloTlsTrust]::Callback
+    $req.Accept = 'application/json, text/xml, */*'
+    $req.UserAgent = 'iLO-HealthCheck/1.0'
+    if (-not $NoAuth) { $req.Headers['Authorization'] = $script:BasicAuth }
+    if ($Body) {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($Body)
+        $req.ContentType = $ContentType
+        $req.ContentLength = $bytes.Length
+        $rs = $req.GetRequestStream(); $rs.Write($bytes, 0, $bytes.Length); $rs.Close()
+    }
+    $resp = $null
+    try { $resp = $req.GetResponse() }
+    catch {
+        $e = $_.Exception
+        while ($e -and -not ($e -is [Net.WebException])) { $e = $e.InnerException }
+        if ($e -and $e.Response) { $resp = $e.Response } else { throw }
+    }
+    try {
+        $sr = New-Object IO.StreamReader($resp.GetResponseStream(), [Text.Encoding]::UTF8)
+        $text = $sr.ReadToEnd(); $sr.Close()
+        [pscustomobject]@{ StatusCode = [int]$resp.StatusCode; Body = $text }
+    } finally { $resp.Close() }
+}
+
+function Get-Severity([string]$Status) {
+    if ([string]::IsNullOrWhiteSpace($Status)) { return 'OK' }
+    $t = $Status.Trim()
+    if ($t -match $script:OkRegex)       { return 'OK' }
+    if ($t -match $script:CriticalRegex) { return 'Critical' }
+    return 'Warning'
+}
+
+function Add-Result([string]$Category, [string]$Name, [string]$Status, [string]$Detail = '') {
+    $script:HostResults.Add([pscustomobject]@{
+        Host      = $script:CurHost
+        Category  = $Category
+        Component = "$Name".Trim()
+        Status    = "$Status".Trim()
+        Severity  = Get-Severity $Status
+        Detail    = $Detail
+    })
+}
+
+# ----------------------------------------------------------------------------------
+# Anonymous identification (iLO 2 - 6): /xmldata?item=all
+# ----------------------------------------------------------------------------------
+function Get-IloXmlInfo {
+    $r = Invoke-IloRequest -Uri "https://$($script:CurHost)/xmldata?item=all" -NoAuth
+    if ($r.StatusCode -ne 200 -or $r.Body -notmatch '<RIMP') { return }
+    [xml]$x = $r.Body
+    $pn = "$($x.RIMP.MP.PN)".Trim()
+    if ($pn -match 'iLO\s*(\d+)') { $script:Info.iLO = "iLO $($Matches[1])" } elseif ($pn) { $script:Info.iLO = $pn }
+    $script:Info.Firmware = "$($x.RIMP.MP.FWRI)".Trim()
+    $script:Info.Model    = "$($x.RIMP.HSI.SPN)".Trim()
+    $script:Info.Serial   = "$($x.RIMP.HSI.SBSN)".Trim()
+}
+
+# ----------------------------------------------------------------------------------
+# Redfish
+# ----------------------------------------------------------------------------------
+function Get-Link($o) { if ($o) { $o.'@odata.id' } }
+
+function Get-Rf([string]$Path) {
+    if (-not $Path) { return $null }
+    if ($script:RfCache.ContainsKey($Path)) { return $script:RfCache[$Path] }
+    $r = Invoke-IloRequest -Uri ("https://{0}{1}" -f $script:CurHost, $Path)
+    if ($r.StatusCode -eq 401) { throw (New-AuthError 'Authentication failed (HTTP 401)') }
+    $obj = $null
+    if ($r.StatusCode -eq 200 -and $r.Body) {
+        try { $obj = $r.Body | ConvertFrom-Json }
+        catch {
+            # iLO 4: duplicate keys differing only by case ("links"/"Links") break PS 5.1 ConvertFrom-Json
+            $obj = ($r.Body -creplace '"links"\s*:', '"_legacy_links":') | ConvertFrom-Json
+        }
+    }
+    $script:RfCache[$Path] = $obj
+    return $obj
+}
+
+function Get-RfMembers([string]$Path) {
+    $c = Get-Rf $Path
+    if (-not $c) { return }
+    foreach ($m in @($c.Members)) {
+        $id = Get-Link $m
+        if ($id) { $o = Get-Rf $id; if ($o) { $o } }
+    }
+}
+
+function Get-RfName($o, [string]$Fallback) {
+    $n = Get-FirstValue $o.Name $o.FanName $o.DeviceLocator $o.MemberId $o.Id $Fallback
+    $loc = Get-FirstValue $o.Location $o.PhysicalLocation.PartLocation.ServiceLabel
+    if ($loc -isnot [string]) { $loc = $null }
+    if ($loc -and "$n" -notlike "*$loc*") { return "$n [$loc]" }
+    return "$n"
+}
+
+function Test-RfItem {
+    param($Obj, [string]$Category, [string]$Name, [string]$Extra, [switch]$Rollup)
+    if (-not $Obj -or -not $Obj.Status) { return }
+    $st = $Obj.Status
+    if ($st.State -eq 'Absent') { return }
+    $sn = "$($Obj.SerialNumber)".Trim()
+    if ($sn -and $Category -match 'Disk|NIC|Power') {
+        $key = "$Category|$sn"
+        if ($script:SeenSN.ContainsKey($key)) { return }   # same part exposed via several Redfish paths
+        $script:SeenSN[$key] = 1
+    }
+    $h = if ($Rollup) { Get-FirstValue $st.HealthRollup $st.Health } else { Get-FirstValue $st.Health $st.HealthRollup }
+    if (-not $h) { return }
+    $d = @()
+    if ($st.State -and $st.State -ne 'Enabled') { $d += "State=$($st.State)" }
+    if ("$($Obj.Model)".Trim()) { $d += "Model=$("$($Obj.Model)".Trim())" }
+    if ($sn) { $d += "SN=$sn" }
+    if ($Extra) { $d += $Extra }
+    Add-Result $Category $Name $h ($d -join '; ')
+}
+
+function Test-Redfish {
+    $r = Invoke-IloRequest -Uri "https://$($script:CurHost)/redfish/v1/" -NoAuth
+    return ($r.StatusCode -eq 200 -and $r.Body -match '"Systems"')
+}
+
+function Invoke-RedfishHealth {
+    $root = Get-Rf '/redfish/v1/'
+    if (-not $root) { throw 'Redfish root not readable' }
+
+    # --- iLO / Manager
+    foreach ($m in Get-RfMembers (Get-Link $root.Managers)) {
+        if ($m.FirmwareVersion) {
+            $script:Info.Firmware = "$($m.FirmwareVersion)"
+            if ($m.FirmwareVersion -match 'iLO\s*(\d+)') { $script:Info.iLO = "iLO $($Matches[1])" }
+        }
+        if (-not $script:Info.iLO -and $m.Model) { $script:Info.iLO = "$($m.Model)" }
+        Test-RfItem $m 'iLO' (Get-FirstValue $m.Model $m.Name 'iLO')
+    }
+
+    # --- Systems
+    foreach ($sys in Get-RfMembers (Get-Link $root.Systems)) {
+        if ($sys.Model)        { $script:Info.Model  = "$($sys.Model)".Trim() }
+        if ($sys.SerialNumber) { $script:Info.Serial = "$($sys.SerialNumber)".Trim() }
+        $script:Info.Power = "$($sys.PowerState)"
+        Test-RfItem $sys 'System' 'Overall' -Rollup
+
+        $oem = Get-FirstValue $sys.Oem.Hpe $sys.Oem.Hp
+
+        # HPE aggregate health (iLO 5/6/7)
+        if ($oem.AggregateHealthStatus) {
+            foreach ($p in $oem.AggregateHealthStatus.PSObject.Properties) {
+                if ($p.Value -is [string]) {
+                    if ($p.Name -match 'Redundancy') { Add-Result 'Summary' $p.Name $p.Value }
+                } elseif ($p.Value.Status) { Test-RfItem $p.Value 'Summary' $p.Name }
+            }
+        }
+
+        foreach ($p in Get-RfMembers (Get-Link $sys.Processors)) { Test-RfItem $p 'Processor' (Get-RfName $p 'CPU') }
+
+        $memLink = Get-FirstValue (Get-Link $sys.Memory) (Get-Link $oem.Links.Memory)
+        foreach ($d in Get-RfMembers $memLink) {
+            $ds = Get-FirstValue $d.DIMMStatus $d.Oem.Hpe.DIMMStatus $d.Oem.Hp.DIMMStatus
+            if ($ds -eq 'NotPresent' -or $d.Status.State -eq 'Absent') { continue }
+            $n = Get-FirstValue $d.DeviceLocator $d.SocketLocator $d.Name $d.Id
+            if ($d.Status.Health) { Test-RfItem $d 'Memory' $n }
+            elseif ($ds)          { Add-Result 'Memory' $n $ds }
+        }
+
+        # Standard Redfish storage (iLO 5 newer fw, iLO 6, iLO 7)
+        foreach ($st in Get-RfMembers (Get-Link $sys.Storage)) {
+            $stn = Get-RfName $st 'Storage'
+            Test-RfItem $st 'Storage' $stn
+            foreach ($sc in @($st.StorageControllers)) { if ($sc) { Test-RfItem $sc 'Storage Controller' (Get-RfName $sc $stn) } }
+            foreach ($sc in Get-RfMembers (Get-Link $st.Controllers)) { Test-RfItem $sc 'Storage Controller' (Get-RfName $sc $stn) }
+            foreach ($dl in @($st.Drives)) {
+                $dr = Get-Rf (Get-Link $dl)
+                if ($dr) { Test-RfItem $dr 'Disk' (Get-RfName $dr 'Drive') }
+            }
+            foreach ($v in Get-RfMembers (Get-Link $st.Volumes)) { Test-RfItem $v 'Logical Drive' (Get-RfName $v 'Volume') }
+        }
+
+        # HPE SmartStorage (iLO 4 / iLO 5)
+        $ss = Get-Rf (Get-Link $oem.Links.SmartStorage)
+        if ($ss) {
+            foreach ($ac in Get-RfMembers (Get-Link $ss.Links.ArrayControllers)) {
+                $acn = "$(Get-FirstValue $ac.Model $ac.Name 'Array Controller') [$($ac.Location)]"
+                Test-RfItem $ac 'Storage Controller' $acn
+                foreach ($pd in Get-RfMembers (Get-Link $ac.Links.PhysicalDrives)) {
+                    Test-RfItem $pd 'Disk' "Drive [$($pd.Location)]" -Extra "CapacityGB=$($pd.CapacityGB)"
+                }
+                foreach ($pd in Get-RfMembers (Get-Link $ac.Links.UnconfiguredDrives)) {
+                    Test-RfItem $pd 'Disk' "Unconfigured Drive [$($pd.Location)]"
+                }
+                foreach ($ld in Get-RfMembers (Get-Link $ac.Links.LogicalDrives)) {
+                    Test-RfItem $ld 'Logical Drive' "LD $($ld.LogicalDriveNumber) RAID $($ld.Raid) ($acn)"
+                }
+                foreach ($en in Get-RfMembers (Get-Link $ac.Links.StorageEnclosures)) {
+                    Test-RfItem $en 'Storage Enclosure' "Enclosure [$($en.Location)]"
+                }
+            }
+        }
+
+        # HPE base network adapters (iLO 4 / 5)
+        foreach ($na in Get-RfMembers (Get-Link $oem.Links.NetworkAdapters)) {
+            $nan = Get-RfName $na 'NIC'
+            Test-RfItem $na 'NIC' $nan
+            $i = 0
+            foreach ($pp in @($na.PhysicalPorts)) { $i++; if ($pp) { Test-RfItem $pp 'NIC Port' "$nan port $i" } }
+        }
+    }
+
+    # --- Chassis: fans, temps, PSUs, NICs
+    foreach ($ch in Get-RfMembers (Get-Link $root.Chassis)) {
+        $th = Get-Rf (Get-Link $ch.Thermal)
+        if ($th) {
+            foreach ($f in @($th.Fans))         { if ($f) { Test-RfItem $f 'Fan' (Get-FirstValue $f.Name $f.FanName "Fan $($f.MemberId)") } }
+            foreach ($t in @($th.Temperatures)) { if ($t) { Test-RfItem $t 'Temperature' (Get-FirstValue $t.Name "Sensor $($t.MemberId)") -Extra "Reading=$($t.ReadingCelsius)C" } }
+            foreach ($r in @($th.Redundancy))   { if ($r) { Test-RfItem $r 'Fan Redundancy' (Get-FirstValue $r.Name 'Fans') } }
+        } elseif ($ch.ThermalSubsystem) {
+            $ts = Get-Rf (Get-Link $ch.ThermalSubsystem)
+            Test-RfItem $ts 'Thermal' 'Thermal Subsystem' -Rollup
+            foreach ($f in Get-RfMembers (Get-Link $ts.Fans)) { Test-RfItem $f 'Fan' (Get-RfName $f 'Fan') }
+        }
+
+        $pw = Get-Rf (Get-Link $ch.Power)
+        if ($pw) {
+            foreach ($ps in @($pw.PowerSupplies)) {
+                if (-not $ps) { continue }
+                $bay = Get-FirstValue $ps.Oem.Hpe.BayNumber $ps.Oem.Hp.BayNumber
+                $n = if ($bay) { "PSU Bay $bay" } else { Get-FirstValue $ps.Name "PSU $($ps.MemberId)" }
+                Test-RfItem $ps 'Power Supply' $n
+            }
+            foreach ($r in @($pw.Redundancy)) { if ($r) { Test-RfItem $r 'Power Redundancy' (Get-FirstValue $r.Name 'PSU') } }
+        } elseif ($ch.PowerSubsystem) {
+            $psub = Get-Rf (Get-Link $ch.PowerSubsystem)
+            Test-RfItem $psub 'Power' 'Power Subsystem' -Rollup
+            foreach ($ps in Get-RfMembers (Get-Link $psub.PowerSupplies)) { Test-RfItem $ps 'Power Supply' (Get-RfName $ps 'PSU') }
+        }
+
+        foreach ($na in Get-RfMembers (Get-Link $ch.NetworkAdapters)) { Test-RfItem $na 'NIC' (Get-RfName $na 'NIC') }
+    }
+}
+
+# ----------------------------------------------------------------------------------
+# RIBCL (iLO 2 / 3 / 4)
+# ----------------------------------------------------------------------------------
+function New-RibclHealthXml {
+    $u = [Security.SecurityElement]::Escape($script:User)
+    $p = [Security.SecurityElement]::Escape($script:Pass)
+    return "<?xml version=`"1.0`"?>`r`n<RIBCL VERSION=`"2.0`">`r`n<LOGIN USER_LOGIN=`"$u`" PASSWORD=`"$p`">`r`n" +
+           "<SERVER_INFO MODE=`"read`">`r`n<GET_EMBEDDED_HEALTH />`r`n</SERVER_INFO>`r`n</LOGIN>`r`n</RIBCL>`r`n"
+}
+
+function Invoke-RibclHttp {
+    $r = Invoke-IloRequest -Uri "https://$($script:CurHost)/ribcl" -Method POST -Body (New-RibclHealthXml) -ContentType 'text/xml' -NoAuth
+    if ($r.StatusCode -ne 200) { throw "HTTP $($r.StatusCode)" }
+    return $r.Body
+}
+
+function Invoke-RibclSocket {
+    $tcp = New-Object Net.Sockets.TcpClient
+    try {
+        $iar = $tcp.BeginConnect($script:CurHost, 443, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne($script:TimeoutMs)) { throw 'Connect timeout' }
+        $tcp.EndConnect($iar)
+        $tcp.ReceiveTimeout = $script:TimeoutMs
+        $tcp.SendTimeout = $script:TimeoutMs
+        $ssl = New-Object Net.Security.SslStream($tcp.GetStream(), $false, [IloTlsTrust]::Callback)
+        $protos = [Security.Authentication.SslProtocols]::Tls12 -bor [Security.Authentication.SslProtocols]::Tls11 -bor [Security.Authentication.SslProtocols]::Tls
+        $ssl.AuthenticateAsClient($script:CurHost, $null, $protos, $false)
+        $bytes = [Text.Encoding]::UTF8.GetBytes((New-RibclHealthXml))
+        $ssl.Write($bytes, 0, $bytes.Length); $ssl.Flush()
+        $ms = New-Object IO.MemoryStream
+        $buf = New-Object byte[] 16384
+        try { while (($n = $ssl.Read($buf, 0, $buf.Length)) -gt 0) { $ms.Write($buf, 0, $n) } }
+        catch { if ($ms.Length -eq 0) { throw } }   # iLO closes / times out after the last block
+        return [Text.Encoding]::UTF8.GetString($ms.ToArray())
+    } finally { $tcp.Close() }
+}
+
+function Read-RibclHealth([string]$Raw) {
+    foreach ($c in [regex]::Matches($Raw, 'STATUS\s*=\s*"(0x[0-9A-Fa-f]{4})"\s*MESSAGE\s*=\s*''([^'']*)''')) {
+        $code = $c.Groups[1].Value; $msg = $c.Groups[2].Value
+        if ($code -ne '0x0000') {
+            if ($code -eq '0x005F' -or $msg -match 'login|password|credential') { throw (New-AuthError "RIBCL: $msg") }
+            throw "RIBCL $code - $msg"
+        }
+    }
+    $m = [regex]::Match($Raw, '(?s)<GET_EMBEDDED_HEALTH_DATA\s*>.*?</GET_EMBEDDED_HEALTH_DATA>')
+    if (-not $m.Success) { throw 'No GET_EMBEDDED_HEALTH_DATA in RIBCL response' }
+    $txt = $m.Value -replace '&(?!(amp|lt|gt|quot|apos|#\d+);)', '&amp;'
+    [xml]$x = $txt
+    $root = $x.DocumentElement
+
+    $catMap = @{ FANS = 'Fan'; TEMPERATURE = 'Temperature'; POWER_SUPPLIES = 'Power Supply'; VRM = 'VRM'
+                 PROCESSORS = 'Processor'; MEMORY = 'Memory'; NIC_INFORMATION = 'NIC'; STORAGE = 'Storage' }
+
+    # Health-at-a-glance summary
+    $hg = $root.SelectSingleNode('HEALTH_AT_A_GLANCE')
+    if ($hg) {
+        foreach ($n in $hg.ChildNodes) {
+            if ($n.NodeType -ne [Xml.XmlNodeType]::Element) { continue }
+            $s = $n.GetAttribute('STATUS');     if ($s) { Add-Result 'Summary' $n.LocalName $s }
+            $r = $n.GetAttribute('REDUNDANCY'); if ($r) { Add-Result 'Summary' "$($n.LocalName) Redundancy" $r }
+        }
+    }
+
+    # Every *STATUS VALUE="..." element in the detail sections
+    $nodes = $root.SelectNodes("//*[substring(local-name(), string-length(local-name()) - 5) = 'STATUS'][@VALUE]")
+    foreach ($s in $nodes) {
+        $p = $s.ParentNode
+        if ($s.LocalName -match 'ENCRYPT|LINK' -or $p.LocalName -eq 'HEALTH_AT_A_GLANCE' -or $p.LocalName -like 'FIRMWARE*') { continue }
+        $present = $p.SelectSingleNode('PRESENT/@VALUE')
+        if ($present -and $present.Value -match '^No') { continue }
+
+        $sec = $p
+        while ($sec.ParentNode -and $sec.ParentNode -ne $root -and $sec.ParentNode.NodeType -eq [Xml.XmlNodeType]::Element) { $sec = $sec.ParentNode }
+        $cat = if ($catMap.ContainsKey($sec.LocalName)) { $catMap[$sec.LocalName] } else { $sec.LocalName }
+        if ($p.LocalName -eq 'PHYSICAL_DRIVE') { $cat = 'Disk' }
+        elseif ($p.LocalName -eq 'LOGICAL_DRIVE') { $cat = 'Logical Drive' }
+        elseif ($p.LocalName -eq 'CONTROLLER') { $cat = 'Storage Controller' }
+
+        $label = $p.SelectSingleNode('LABEL/@VALUE')
+        $name = if ($label) { $label.Value } else { $null }
+        if (-not $name) {
+            $sock = $s.SelectSingleNode('preceding-sibling::SOCKET[1]/@VALUE')
+            if ($sock) { $name = "$($p.LocalName) DIMM $($sock.Value)" }
+        }
+        if (-not $name) {
+            $port = $p.SelectSingleNode('NETWORK_PORT/@VALUE'); $desc = $p.SelectSingleNode('PORT_DESCRIPTION/@VALUE')
+            if ($port -or $desc) { $name = "$(if ($desc) { $desc.Value }) $(if ($port) { $port.Value })".Trim() }
+        }
+        if (-not $name) { $nm = $p.SelectSingleNode('NAME/@VALUE'); if ($nm) { $name = $nm.Value } }
+        if (-not $name) { $name = $p.LocalName }
+        if ($s.LocalName -ne 'STATUS') { $name = "$name ($($s.LocalName))" }
+
+        $loc = $p.SelectSingleNode('LOCATION/@VALUE'); $sn = $p.SelectSingleNode('SERIAL_NUMBER/@VALUE'); $mdl = $p.SelectSingleNode('MODEL/@VALUE')
+        $d = @()
+        if ($loc -and $name -notlike "*$($loc.Value)*") { $d += "Location=$($loc.Value)" }
+        if ($mdl) { $d += "Model=$($mdl.Value.Trim())" }
+        if ($sn)  { $d += "SN=$($sn.Value.Trim())" }
+        Add-Result $cat $name $s.GetAttribute('VALUE') ($d -join '; ')
+    }
+}
+
+# ----------------------------------------------------------------------------------
+# Per-host check
+# ----------------------------------------------------------------------------------
+function Invoke-HostCheck([string]$H) {
+    $script:CurHost = $H
+    $script:RfCache = @{}
+    $script:SeenSN  = @{}
+    $script:HostResults = New-Object System.Collections.Generic.List[object]
+    $script:Info = [ordered]@{ Host = $H; Model = ''; Serial = ''; iLO = ''; Firmware = ''; Method = ''; Power = ''
+                               Result = ''; Critical = 0; Warning = 0; Checked = 0; Error = '' }
+
+    if (-not (Test-Tcp $H 443 5000)) { throw 'TCP 443 unreachable' }
+    try { Get-IloXmlInfo } catch { Write-Verbose "$H xmldata: $($_.Exception.Message)" }
+
+    $gen = 0
+    if ($script:Info.iLO -match '(\d+)') { $gen = [int]$Matches[1] }
+    $errs = @()
+
+    # 1) Redfish
+    if ($gen -eq 0 -or $gen -ge 4) {
+        try {
+            if (Test-Redfish) { Invoke-RedfishHealth; $script:Info.Method = 'Redfish' }
+            else { $errs += 'Redfish not available' }
+        } catch {
+            if (Test-IsAuthError $_) { throw }
+            $errs += "Redfish: $($_.Exception.Message)"
+            $script:HostResults.Clear()
+        }
+        if ($script:Info.Method -and $script:HostResults.Count -eq 0) {
+            $errs += 'Redfish returned no health data'; $script:Info.Method = ''
+        }
+    }
+    # 2) RIBCL over HTTPS
+    if (-not $script:Info.Method -and $gen -ne 2 -and ($gen -lt 7)) {
+        try { Read-RibclHealth (Invoke-RibclHttp); $script:Info.Method = 'RIBCL-HTTPS' }
+        catch {
+            if (Test-IsAuthError $_) { throw }
+            $errs += "RIBCL-HTTPS: $($_.Exception.Message)"; $script:HostResults.Clear()
+        }
+    }
+    # 3) RIBCL raw socket (iLO 2 / iLO 3)
+    if (-not $script:Info.Method -and $gen -le 3) {
+        try { Read-RibclHealth (Invoke-RibclSocket); $script:Info.Method = 'RIBCL-Socket' }
+        catch {
+            if (Test-IsAuthError $_) { throw }
+            $errs += "RIBCL-Socket: $($_.Exception.Message)"; $script:HostResults.Clear()
+        }
+    }
+    if (-not $script:Info.Method) { throw ($errs -join ' | ') }
+}
+
+# ----------------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------------
+$Summary = New-Object System.Collections.Generic.List[object]
+$AllRes  = New-Object System.Collections.Generic.List[object]
+$authFails = 0
+$i = 0
+
+Write-Out ('=' * 100)
+Write-Out ("iLO Health Check  {0}  |  Run by: {1}\{2} on {3}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm'), $env:USERDOMAIN, $env:USERNAME, $env:COMPUTERNAME)
+Write-Out ("Host file: {0}  |  Servers: {1}  |  iLO user: {2}" -f (Split-Path $HostFile -Leaf), $Hosts.Count, $UserName)
+Write-Out ('=' * 100)
+
+try {
+    foreach ($h in $Hosts) {
+        $i++
+        Write-Progress -Activity 'iLO health check' -Status "$h ($i/$($Hosts.Count))" -PercentComplete ($i / $Hosts.Count * 100)
+
+        if ($authFails -ge $MaxAuthFailures) {
+            Write-Out ("[{0,-8}] {1,-18} Skipped after repeated auth failures" -f 'SKIPPED', $h) 'Red'
+            $Summary.Add([pscustomobject]@{ Host = $h; Model = ''; Serial = ''; iLO = ''; Firmware = ''; Method = ''; Power = ''
+                                            Result = 'SKIPPED'; Critical = 0; Warning = 0; Checked = 0; Error = 'Skipped after repeated auth failures' })
+            continue
+        }
+
+        try {
+            Invoke-HostCheck $h
+            $authFails = 0
+            $crit = @($script:HostResults | Where-Object Severity -eq 'Critical').Count
+            $warn = @($script:HostResults | Where-Object Severity -eq 'Warning').Count
+            $script:Info.Critical = $crit
+            $script:Info.Warning  = $warn
+            $script:Info.Checked  = $script:HostResults.Count
+            $script:Info.Result   = if ($crit) { 'CRITICAL' } elseif ($warn) { 'WARNING' } else { 'OK' }
+        } catch {
+            if (Test-IsAuthError $_) { $authFails++ }
+            $script:Info.Result = 'ERROR'
+            $script:Info.Error  = $_.Exception.Message
+        }
+
+        foreach ($r in $script:HostResults) { $AllRes.Add($r) }
+        $Summary.Add([pscustomobject]$script:Info)
+
+        # Console
+        $s = $script:Info
+        $color = switch ($s.Result) { 'OK' { 'Green' } 'WARNING' { 'Yellow' } default { 'Red' } }
+        Write-Out ("[{0,-8}] {1,-18} {2,-28} {3,-6} {4,-14} {5}" -f $s.Result, $h, $s.Model, $s.iLO, $s.Method,
+            $(if ($s.Error) { $s.Error } else { "$($s.Checked) components" })) $color
+        if ($s.Serial -or $s.Firmware) {
+            Write-Out ("           SN: {0}  FW: {1}  Power: {2}" -f $s.Serial, $s.Firmware, $s.Power) 'DarkGray'
+        }
+        foreach ($r in ($script:HostResults | Where-Object Severity -ne 'OK')) {
+            $c = if ($r.Severity -eq 'Critical') { 'Red' } else { 'Yellow' }
+            Write-Out ("           - {0,-18} {1,-40} {2,-14} {3}" -f $r.Category, $r.Component, $r.Status, $r.Detail) $c
+        }
+    }
+}
+finally {
+    Write-Progress -Activity 'iLO health check' -Completed
+    $script:Pass = $null; $script:BasicAuth = $null; $Credential = $null
+    [GC]::Collect()
+}
+
+# ----------------------------------------------------------------------------------
+# Reports
+# ----------------------------------------------------------------------------------
+$sumFile = Join-Path $ReportDir "iLO_Summary_$Stamp.csv"
+$issFile = Join-Path $ReportDir "iLO_Issues_$Stamp.csv"
+$Summary | Export-Csv -LiteralPath $sumFile -NoTypeInformation -Encoding UTF8
+
+$issues = @($AllRes | Where-Object Severity -ne 'OK')
+$issues += $Summary | Where-Object { $_.Result -in 'ERROR', 'SKIPPED' } | ForEach-Object {
+    [pscustomobject]@{ Host = $_.Host; Category = 'Connection'; Component = 'iLO'; Status = $_.Result; Severity = 'Error'; Detail = $_.Error }
+}
+$issues | Export-Csv -LiteralPath $issFile -NoTypeInformation -Encoding UTF8
+
+if ($FullDetail) {
+    $AllRes | Export-Csv -LiteralPath (Join-Path $ReportDir "iLO_Detail_$Stamp.csv") -NoTypeInformation -Encoding UTF8
+}
+
+$cnt = $Summary | Group-Object Result | ForEach-Object { "$($_.Name)=$($_.Count)" }
+Write-Out ''
+Write-Out ('-' * 100)
+Write-Out "Servers: $($Summary.Count)  ($($cnt -join ', '))"
+Write-Out "CSV reports: $ReportDir"
+Write-Out "TXT report : $TxtFile"
+Write-Out ('-' * 100)
+
+try {
+    # Same-day reruns overwrite the day's file
+    $script:TxtLines | Set-Content -LiteralPath $TxtFile -Encoding UTF8
+} catch {
+    Write-Host "Could not write TXT report: $($_.Exception.Message)" -ForegroundColor Red
+}
+
+if ($Summary | Where-Object { $_.Result -in 'ERROR', 'SKIPPED' }) { exit 2 }
+if ($Summary | Where-Object { $_.Result -in 'CRITICAL', 'WARNING' }) { exit 1 }
+exit 0
