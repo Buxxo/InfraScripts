@@ -1,0 +1,184 @@
+<#
+.SYNOPSIS
+    READ-ONLY report of user profiles on a Windows Server (2012 R2+ / PowerShell 4.0+).
+    Shows last use of every profile and how much space inactive profiles take.
+    NOTHING is deleted, modified or sent anywhere. Output = CSV + console summary.
+
+.PARAMETER InactiveDays
+    Profiles not used for this many days are marked as cleanup candidates. Default 90.
+
+.PARAMETER OutDir
+    Folder for the CSV report. Default: C:\Users\Public\Documents
+
+.EXAMPLE
+    .\Get-ProfileUsageReport.ps1 -InactiveDays 120
+#>
+#Requires -Version 4.0
+#Requires -RunAsAdministrator
+[CmdletBinding()]
+param(
+    [int]$InactiveDays = 90,
+    [string]$OutDir = "$env:PUBLIC\Documents"
+)
+
+$ErrorActionPreference = 'Continue'
+$now     = Get-Date
+$cutoff  = $now.AddDays(-$InactiveDays)
+$skipDirs = @('Public','Default','Default User','All Users','defaultuser0')
+
+# ---------- helpers ----------
+function Get-DirSize {
+    # Iterative walk, skips junctions/symlinks (no double counting), counts unreadable folders.
+    param([string]$Path)
+    $bytes = [long]0; $errors = 0
+    $stack = New-Object 'System.Collections.Generic.Stack[string]'
+    $stack.Push($Path)
+    while ($stack.Count -gt 0) {
+        $dir = $stack.Pop()
+        try {
+            $di = New-Object System.IO.DirectoryInfo $dir
+            foreach ($f in $di.GetFiles()) { $bytes += $f.Length }
+            foreach ($d in $di.GetDirectories()) {
+                if (-not ($d.Attributes -band [IO.FileAttributes]::ReparsePoint)) { $stack.Push($d.FullName) }
+            }
+        } catch { $errors++ }
+    }
+    New-Object PSObject -Property @{ Bytes = $bytes; Errors = $errors }
+}
+
+function Get-FileTime([string]$Path) {
+    try { if (Test-Path -LiteralPath $Path) { return (Get-Item -LiteralPath $Path -Force).LastWriteTime } } catch {}
+    return $null
+}
+
+$machineSid = $null
+try {
+    $machineSid = ((New-Object System.Security.Principal.NTAccount("$env:COMPUTERNAME\Administrator")).Translate(
+        [System.Security.Principal.SecurityIdentifier]).AccountDomainSid).Value
+} catch {}
+
+function Get-AccountInfo([string]$Sid) {
+    $r = @{ Account = $null; AccountState = 'Unknown'; ADLastLogon = $null }
+    try {
+        $r.Account = (New-Object System.Security.Principal.SecurityIdentifier $Sid).Translate(
+            [System.Security.Principal.NTAccount]).Value
+    } catch { $r.AccountState = 'ORPHANED (SID not resolvable)'; return $r }
+
+    if ($machineSid -and $Sid.StartsWith($machineSid)) { $r.AccountState = 'Local account'; return $r }
+    try {
+        $s = New-Object System.DirectoryServices.DirectorySearcher
+        $s.Filter = "(objectSid=$Sid)"
+        [void]$s.PropertiesToLoad.Add('useraccountcontrol')
+        [void]$s.PropertiesToLoad.Add('lastlogontimestamp')
+        $res = $s.FindOne()
+        if (-not $res) { $r.AccountState = 'Not found in AD'; return $r }
+        $uac = [int]$res.Properties['useraccountcontrol'][0]
+        $r.AccountState = $(if ($uac -band 2) { 'AD - DISABLED' } else { 'AD - Enabled' })
+        if ($res.Properties['lastlogontimestamp'].Count) {
+            $r.ADLastLogon = [DateTime]::FromFileTime([long]$res.Properties['lastlogontimestamp'][0])
+        }
+    } catch { $r.AccountState = 'AD lookup failed' }
+    return $r
+}
+
+# ---------- collect ----------
+$profRoot = [Environment]::ExpandEnvironmentVariables(
+    (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList').ProfilesDirectory)
+
+$wmiProfiles = @(Get-WmiObject -Class Win32_UserProfile | Where-Object { -not $_.Special -and $_.LocalPath })
+$registered  = @{}
+foreach ($p in $wmiProfiles) { $registered[$p.LocalPath.ToLower()] = $p }
+
+# Folders in profile root that have no registry/WMI profile (leftovers)
+$folders = @(Get-ChildItem -LiteralPath $profRoot -Directory -Force -ErrorAction SilentlyContinue |
+    Where-Object { $skipDirs -notcontains $_.Name -and -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) })
+
+$targets = @()
+foreach ($p in $wmiProfiles) { $targets += New-Object PSObject -Property @{ Path = $p.LocalPath; Wmi = $p } }
+foreach ($f in $folders) {
+    if (-not $registered.ContainsKey($f.FullName.ToLower())) {
+        $targets += New-Object PSObject -Property @{ Path = $f.FullName; Wmi = $null }
+    }
+}
+
+$results = @()
+$i = 0
+foreach ($t in $targets) {
+    $i++
+    Write-Progress -Activity 'Scanning profiles (read-only)' -Status $t.Path -PercentComplete ($i / $targets.Count * 100)
+
+    $exists   = Test-Path -LiteralPath $t.Path
+    $ntuser   = Get-FileTime (Join-Path $t.Path 'NTUSER.DAT')
+    $usrclass = Get-FileTime (Join-Path $t.Path 'AppData\Local\Microsoft\Windows\UsrClass.dat')
+    $lastAct  = @($ntuser, $usrclass) | Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1
+
+    $wmiLast = $null; $loaded = $false; $sid = $null; $acct = @{ Account = $null; AccountState = 'No profile registration'; ADLastLogon = $null }
+    if ($t.Wmi) {
+        $sid    = $t.Wmi.SID
+        $loaded = [bool]$t.Wmi.Loaded
+        if ($t.Wmi.LastUseTime) { try { $wmiLast = [Management.ManagementDateTimeConverter]::ToDateTime($t.Wmi.LastUseTime) } catch {} }
+        $acct = Get-AccountInfo $sid
+    }
+
+    $size = if ($exists) { Get-DirSize $t.Path } else { New-Object PSObject -Property @{ Bytes = 0; Errors = 0 } }
+
+    # Candidate logic (report only)
+    $reasons = @()
+    if ($loaded)                                   { $reasons += 'IN USE (loaded)' }
+    if (-not $t.Wmi)                               { $reasons += 'Folder without profile registration' }
+    if ($t.Path -match '\.(TEMP|\d{3})$|TEMP\.')   { $reasons += 'Temp/duplicate profile' }
+    if ($acct.AccountState -like 'ORPHANED*' -or $acct.AccountState -eq 'Not found in AD') { $reasons += 'Account gone' }
+    if ($acct.AccountState -eq 'AD - DISABLED')    { $reasons += 'Account disabled' }
+    if (-not $lastAct -or $lastAct -lt $cutoff)    { $reasons += "Inactive > $InactiveDays d" }
+    if (-not $exists)                              { $reasons += 'Folder missing (stale registry entry)' }
+
+    $candidate = (-not $loaded) -and ($reasons | Where-Object { $_ -ne 'IN USE (loaded)' }).Count -gt 0
+
+    $results += [PSCustomObject][ordered]@{
+        ProfilePath       = $t.Path
+        Account           = $acct.Account
+        SID               = $sid
+        AccountState      = $acct.AccountState
+        Loaded            = $loaded
+        LastActivity      = $lastAct
+        DaysInactive      = $(if ($lastAct) { [int]($now - $lastAct).TotalDays } else { $null })
+        NTUSER_DAT        = $ntuser
+        UsrClass_DAT      = $usrclass
+        WMI_LastUseTime   = $wmiLast
+        AD_LastLogon_Any  = $acct.ADLastLogon
+        SizeGB            = [math]::Round($size.Bytes / 1GB, 3)
+        UnreadableFolders = $size.Errors
+        Candidate         = $candidate
+        Reasons           = ($reasons -join '; ')
+    }
+}
+Write-Progress -Activity 'Scanning profiles (read-only)' -Completed
+
+# ---------- output ----------
+if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Path $OutDir | Out-Null }
+$csv = Join-Path $OutDir ("ProfileReport_{0}_{1:yyyyMMdd_HHmm}.csv" -f $env:COMPUTERNAME, $now)
+$results | Sort-Object SizeGB -Descending | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8
+
+$totalGB = ($results | Measure-Object SizeGB -Sum).Sum
+$cand    = @($results | Where-Object Candidate)
+$candGB  = ($cand | Measure-Object SizeGB -Sum).Sum
+$drive   = Get-WmiObject Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $profRoot.Substring(0,2))
+
+Write-Host ''
+Write-Host '===== PROFILE REPORT (read-only, nothing changed) =====' -ForegroundColor Cyan
+Write-Host ("Server            : {0}" -f $env:COMPUTERNAME)
+Write-Host ("Profile root      : {0}  (free {1:N1} GB of {2:N1} GB)" -f $profRoot, ($drive.FreeSpace/1GB), ($drive.Size/1GB))
+Write-Host ("Profiles scanned  : {0}  total {1:N2} GB" -f $results.Count, $totalGB)
+Write-Host ("In use (loaded)   : {0}" -f @($results | Where-Object Loaded).Count)
+Write-Host ("Cleanup candidates: {0}  -> potential savings {1:N2} GB" -f $cand.Count, $candGB) -ForegroundColor Yellow
+Write-Host ''
+$cand | Group-Object { ($_.Reasons -split '; ')[0] } |
+    Select-Object Name, Count, @{n='GB';e={[math]::Round(($_.Group | Measure-Object SizeGB -Sum).Sum,2)}} |
+    Sort-Object GB -Descending | Format-Table -AutoSize
+Write-Host 'Top 15 candidates by size:'
+$cand | Sort-Object SizeGB -Descending | Select-Object -First 15 Account, ProfilePath, DaysInactive, SizeGB, AccountState |
+    Format-Table -AutoSize
+Write-Host ("CSV: {0}" -f $csv) -ForegroundColor Green
+if (@($results | Where-Object { $_.UnreadableFolders -gt 0 }).Count) {
+    Write-Host 'Note: some subfolders were unreadable (ACL/long path) - sizes for those profiles may be slightly low.' -ForegroundColor DarkYellow
+}
