@@ -1,184 +1,311 @@
 <#
 .SYNOPSIS
-    READ-ONLY report of user profiles on a Windows Server (2012 R2+ / PowerShell 4.0+).
-    Shows last use of every profile and how much space inactive profiles take.
-    NOTHING is deleted, modified or sent anywhere. Output = CSV + console summary.
+    READ-ONLY profile usage + temp/cache report for RDS / jump servers (Windows Server 2012 R2+, PowerShell 4.0+).
+    - No domain/AD queries. Uses only local event logs, local registry and file timestamps.
+    - Deletes / modifies NOTHING. Does not load user registry hives.
+    - Writes 2 CSVs into the script folder ($PSScriptRoot).
 
-.PARAMETER InactiveDays
-    Profiles not used for this many days are marked as cleanup candidates. Default 90.
-
-.PARAMETER OutDir
-    Folder for the CSV report. Default: C:\Users\Public\Documents
+.PARAMETER InactiveDays   Profile with no activity for this many days = cleanup candidate. Default 90.
+.PARAMETER TempAgeDays    Only files older than this in %TEMP% are counted as safe. Default 7.
+.PARAMETER SkipEventLogs  Skip reading Security / RDS logs (faster, less accurate).
+.PARAMETER Delimiter      CSV delimiter. Default ';' (opens directly in Excel with SK/CZ/DE regional settings).
 
 .EXAMPLE
-    .\Get-ProfileUsageReport.ps1 -InactiveDays 120
+    .\Get-ProfileUsageReport.ps1 -InactiveDays 120 -TempAgeDays 14
 #>
 #Requires -Version 4.0
 #Requires -RunAsAdministrator
 [CmdletBinding()]
 param(
     [int]$InactiveDays = 90,
-    [string]$OutDir = "$env:PUBLIC\Documents"
+    [int]$TempAgeDays  = 7,
+    [switch]$SkipEventLogs,
+    [string]$Delimiter = ';'
 )
 
 $ErrorActionPreference = 'Continue'
-$now     = Get-Date
-$cutoff  = $now.AddDays(-$InactiveDays)
-$skipDirs = @('Public','Default','Default User','All Users','defaultuser0')
+$now      = Get-Date
+$cutoff   = $now.AddDays(-$InactiveDays)
+$tempCut  = $now.AddDays(-$TempAgeDays)
+$outDir   = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$stamp    = $now.ToString('yyyyMMdd_HHmm')
+$skipDirs = @('public','default','default user','all users','defaultuser0')
 
-# ---------- helpers ----------
-function Get-DirSize {
-    # Iterative walk, skips junctions/symlinks (no double counting), counts unreadable folders.
-    param([string]$Path)
-    $bytes = [long]0; $errors = 0
-    $stack = New-Object 'System.Collections.Generic.Stack[string]'
-    $stack.Push($Path)
-    while ($stack.Count -gt 0) {
-        $dir = $stack.Pop()
-        try {
-            $di = New-Object System.IO.DirectoryInfo $dir
-            foreach ($f in $di.GetFiles()) { $bytes += $f.Length }
-            foreach ($d in $di.GetDirectories()) {
-                if (-not ($d.Attributes -band [IO.FileAttributes]::ReparsePoint)) { $stack.Push($d.FullName) }
-            }
-        } catch { $errors++ }
+# ---------------- helpers ----------------
+function Get-DirStats {
+    # Iterative walk, skips junctions (no double counting). Counts only files older than $OlderThan.
+    param([string]$Path, [datetime]$OlderThan = [datetime]::MaxValue)
+    $bytes = [long]0; $files = 0; $newest = $null; $err = 0
+    if ([IO.Directory]::Exists($Path)) {
+        $stack = New-Object 'System.Collections.Generic.Stack[string]'
+        $stack.Push($Path)
+        while ($stack.Count -gt 0) {
+            $dir = $stack.Pop()
+            try {
+                $di = New-Object IO.DirectoryInfo $dir
+                foreach ($f in $di.GetFiles()) {
+                    if ($f.LastWriteTime -lt $OlderThan) { $bytes += $f.Length; $files++ }
+                    if (-not $newest -or $f.LastWriteTime -gt $newest) { $newest = $f.LastWriteTime }
+                }
+                foreach ($d in $di.GetDirectories()) {
+                    if (-not ($d.Attributes -band [IO.FileAttributes]::ReparsePoint)) { $stack.Push($d.FullName) }
+                }
+            } catch { $err++ }
+        }
     }
-    New-Object PSObject -Property @{ Bytes = $bytes; Errors = $errors }
+    New-Object PSObject -Property @{ Bytes = $bytes; Files = $files; Newest = $newest; Errors = $err }
 }
 
-function Get-FileTime([string]$Path) {
-    try { if (Test-Path -LiteralPath $Path) { return (Get-Item -LiteralPath $Path -Force).LastWriteTime } } catch {}
+function Get-WriteTime([string]$p) {
+    if ([IO.File]::Exists($p)) { return [IO.File]::GetLastWriteTime($p) }
     return $null
 }
 
-$machineSid = $null
-try {
-    $machineSid = ((New-Object System.Security.Principal.NTAccount("$env:COMPUTERNAME\Administrator")).Translate(
-        [System.Security.Principal.SecurityIdentifier]).AccountDomainSid).Value
-} catch {}
+function Get-RegTime($key, [string]$hi, [string]$lo) {
+    $h = $key.GetValue($hi); $l = $key.GetValue($lo)
+    if ($null -eq $h -or $null -eq $l) { return $null }
+    $ft = ([long]$h -band 4294967295L) * 4294967296L + ([long]$l -band 4294967295L)
+    if ($ft -le 0) { return $null }
+    try { return [DateTime]::FromFileTime($ft) } catch { return $null }
+}
 
-function Get-AccountInfo([string]$Sid) {
-    $r = @{ Account = $null; AccountState = 'Unknown'; ADLastLogon = $null }
-    try {
-        $r.Account = (New-Object System.Security.Principal.SecurityIdentifier $Sid).Translate(
-            [System.Security.Principal.NTAccount]).Value
-    } catch { $r.AccountState = 'ORPHANED (SID not resolvable)'; return $r }
+function F($d) { if ($d) { $d.ToString('yyyy-MM-dd HH:mm') } else { '' } }
 
-    if ($machineSid -and $Sid.StartsWith($machineSid)) { $r.AccountState = 'Local account'; return $r }
+# ---------------- 1. profiles from local registry ----------------
+$plKeyPath = 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+$pl        = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($plKeyPath)   # read-only
+$profRoot  = [Environment]::ExpandEnvironmentVariables([string]$pl.GetValue('ProfilesDirectory')).TrimEnd('\')
+
+$profiles = @()
+foreach ($keyName in $pl.GetSubKeyNames()) {
+    if ($keyName -notmatch '^S-1-5-21-') { continue }          # skip SYSTEM, LocalService, NetworkService
+    $k    = $pl.OpenSubKey($keyName)
+    $path = [Environment]::ExpandEnvironmentVariables([string]$k.GetValue('ProfileImagePath')).TrimEnd('\')
+    $sid  = $keyName -replace '\.bak$', ''
+    $profiles += New-Object PSObject -Property @{
+        SID            = $sid
+        RegKey         = $keyName
+        Path           = $path
+        Folder         = Split-Path $path -Leaf
+        Registered     = $true
+        Loaded         = (Test-Path -LiteralPath "Registry::HKEY_USERS\$sid")
+        RegLoad        = Get-RegTime $k 'ProfileLoadTimeHigh'      'ProfileLoadTimeLow'
+        RegLocalLoad   = Get-RegTime $k 'LocalProfileLoadTimeHigh' 'LocalProfileLoadTimeLow'
+        RegLocalUnload = Get-RegTime $k 'LocalProfileUnloadTimeHigh' 'LocalProfileUnloadTimeLow'
+    }
+    $k.Close()
+}
+$pl.Close()
+
+# Folders in profile root without a ProfileList entry (leftovers)
+$knownPaths = @{}
+foreach ($p in $profiles) { $knownPaths[$p.Path.ToLower()] = 1 }
+foreach ($d in (Get-ChildItem -LiteralPath $profRoot -Directory -Force -ErrorAction SilentlyContinue)) {
+    if ($skipDirs -contains $d.Name.ToLower()) { continue }
+    if ($d.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+    if ($knownPaths.ContainsKey($d.FullName.ToLower().TrimEnd('\'))) { continue }
+    $profiles += New-Object PSObject -Property @{
+        SID = ''; RegKey = ''; Path = $d.FullName.TrimEnd('\'); Folder = $d.Name; Registered = $false
+        Loaded = $false; RegLoad = $null; RegLocalLoad = $null; RegLocalUnload = $null
+    }
+}
+
+# ---------------- 2. local event logs ----------------
+$secBySid = @{}; $secName = @{}; $lsmByName = @{}; $secFrom = $null; $lsmFrom = $null
+if (-not $SkipEventLogs) {
+    Write-Progress -Activity 'Reading local event logs' -Status 'Security 4624 (interactive / RDP / unlock / cached)'
     try {
-        $s = New-Object System.DirectoryServices.DirectorySearcher
-        $s.Filter = "(objectSid=$Sid)"
-        [void]$s.PropertiesToLoad.Add('useraccountcontrol')
-        [void]$s.PropertiesToLoad.Add('lastlogontimestamp')
-        $res = $s.FindOne()
-        if (-not $res) { $r.AccountState = 'Not found in AD'; return $r }
-        $uac = [int]$res.Properties['useraccountcontrol'][0]
-        $r.AccountState = $(if ($uac -band 2) { 'AD - DISABLED' } else { 'AD - Enabled' })
-        if ($res.Properties['lastlogontimestamp'].Count) {
-            $r.ADLastLogon = [DateTime]::FromFileTime([long]$res.Properties['lastlogontimestamp'][0])
+        $secFrom = (Get-WinEvent -LogName Security -MaxEvents 1 -Oldest -ErrorAction Stop).TimeCreated
+        $xp = "*[System[(EventID=4624)]] and *[EventData[Data[@Name='LogonType']='2' or " +
+              "Data[@Name='LogonType']='7' or Data[@Name='LogonType']='10' or Data[@Name='LogonType']='11']]"
+        foreach ($e in (Get-WinEvent -LogName Security -FilterXPath $xp -ErrorAction Stop)) {   # newest first
+            $sid = [string]$e.Properties[4].Value
+            if (-not $secBySid.ContainsKey($sid)) {
+                $secBySid[$sid] = $e.TimeCreated
+                $secName[$sid]  = ('{0}\{1}' -f $e.Properties[6].Value, $e.Properties[5].Value)
+            }
         }
-    } catch { $r.AccountState = 'AD lookup failed' }
-    return $r
+    } catch { Write-Warning "Security log: $($_.Exception.Message)" }
+
+    Write-Progress -Activity 'Reading local event logs' -Status 'RDS LocalSessionManager 21/25 (logon / reconnect)'
+    $lsmLog = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
+    try {
+        $lsmFrom = (Get-WinEvent -LogName $lsmLog -MaxEvents 1 -Oldest -ErrorAction Stop).TimeCreated
+        foreach ($e in (Get-WinEvent -FilterHashtable @{ LogName = $lsmLog; Id = 21, 25 } -ErrorAction Stop)) {
+            $u = ([string]$e.Properties[0].Value).ToLower()
+            if ($u -match '\\' -and -not $lsmByName.ContainsKey($u)) { $lsmByName[$u] = $e.TimeCreated }
+        }
+    } catch { Write-Warning "RDS LSM log: $($_.Exception.Message)" }
+    Write-Progress -Activity 'Reading local event logs' -Completed
 }
 
-# ---------- collect ----------
-$profRoot = [Environment]::ExpandEnvironmentVariables(
-    (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList').ProfilesDirectory)
+# Folder-name matching for RDS events (DOMAIN\user -> user | user.DOMAIN | user.DOMAIN.000 | user.000)
+$folderSet = @{}
+foreach ($p in $profiles) { $folderSet[$p.Folder.ToLower()] = 1 }
 
-$wmiProfiles = @(Get-WmiObject -Class Win32_UserProfile | Where-Object { -not $_.Special -and $_.LocalPath })
-$registered  = @{}
-foreach ($p in $wmiProfiles) { $registered[$p.LocalPath.ToLower()] = $p }
-
-# Folders in profile root that have no registry/WMI profile (leftovers)
-$folders = @(Get-ChildItem -LiteralPath $profRoot -Directory -Force -ErrorAction SilentlyContinue |
-    Where-Object { $skipDirs -notcontains $_.Name -and -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) })
-
-$targets = @()
-foreach ($p in $wmiProfiles) { $targets += New-Object PSObject -Property @{ Path = $p.LocalPath; Wmi = $p } }
-foreach ($f in $folders) {
-    if (-not $registered.ContainsKey($f.FullName.ToLower())) {
-        $targets += New-Object PSObject -Property @{ Path = $f.FullName; Wmi = $null }
+function Find-LsmTime([string]$acct, [string]$folder) {
+    if ($acct) { $k = $acct.ToLower(); if ($lsmByName.ContainsKey($k)) { return $lsmByName[$k] } }
+    $f = $folder.ToLower(); $explicit = @(); $plain = @()
+    foreach ($key in $lsmByName.Keys) {
+        $parts = $key -split '\\', 2; $d = $parts[0]; $u = $parts[1]
+        $eu = [regex]::Escape($u); $ed = [regex]::Escape($d)
+        if ($f -match "^$eu\.$ed(\.\d{3})?$") { $explicit += $key }
+        elseif ($f -match "^$eu(\.\d{3})?$" -and -not $folderSet.ContainsKey("$u.$d")) { $plain += $key }
     }
+    if ($explicit.Count -eq 1) { return $lsmByName[$explicit[0]] }
+    if ($plain.Count -eq 1)    { return $lsmByName[$plain[0]] }
+    return $null   # none or ambiguous (same user name in several domains)
 }
 
-$results = @()
-$i = 0
-foreach ($t in $targets) {
+# ---------------- 3. per-profile last-use evidence ----------------
+$i = 0; $rows = @()
+foreach ($p in $profiles) {
     $i++
-    Write-Progress -Activity 'Scanning profiles (read-only)' -Status $t.Path -PercentComplete ($i / $targets.Count * 100)
+    Write-Progress -Activity 'Scanning profiles (read-only)' -Status $p.Path -PercentComplete ($i / $profiles.Count * 100)
+    $p | Add-Member NoteProperty Exists   ([IO.Directory]::Exists($p.Path))
+    $p | Add-Member NoteProperty NTUSER   (Get-WriteTime (Join-Path $p.Path 'NTUSER.DAT'))
+    $p | Add-Member NoteProperty UsrClass (Get-WriteTime (Join-Path $p.Path 'AppData\Local\Microsoft\Windows\UsrClass.dat'))
+    $p | Add-Member NoteProperty Recent   ((Get-DirStats (Join-Path $p.Path 'AppData\Roaming\Microsoft\Windows\Recent')).Newest)
+    $p | Add-Member NoteProperty Sec      $(if ($p.SID -and $secBySid.ContainsKey($p.SID)) { $secBySid[$p.SID] } else { $null })
+    $p | Add-Member NoteProperty Account  $(if ($p.SID -and $secName.ContainsKey($p.SID))  { $secName[$p.SID] }  else { '' })
+    $p | Add-Member NoteProperty Lsm      (Find-LsmTime $p.Account $p.Folder)
+    $p | Add-Member NoteProperty Size     $(if ($p.Exists) { Get-DirStats $p.Path } else { $null })
+}
 
-    $exists   = Test-Path -LiteralPath $t.Path
-    $ntuser   = Get-FileTime (Join-Path $t.Path 'NTUSER.DAT')
-    $usrclass = Get-FileTime (Join-Path $t.Path 'AppData\Local\Microsoft\Windows\UsrClass.dat')
-    $lastAct  = @($ntuser, $usrclass) | Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1
+# NTUSER.DAT is often bulk-touched (patching/AV/backup). If many profiles share the same minute -> unreliable.
+$massTouched = @{}
+$profiles | Where-Object { $_.NTUSER } | Group-Object { $_.NTUSER.ToString('yyyyMMddHHmm') } |
+    Where-Object { $_.Count -ge 5 -and $_.Count -ge ($profiles.Count * 0.2) } |
+    ForEach-Object { $massTouched[$_.Name] = $_.Count }
 
-    $wmiLast = $null; $loaded = $false; $sid = $null; $acct = @{ Account = $null; AccountState = 'No profile registration'; ADLastLogon = $null }
-    if ($t.Wmi) {
-        $sid    = $t.Wmi.SID
-        $loaded = [bool]$t.Wmi.Loaded
-        if ($t.Wmi.LastUseTime) { try { $wmiLast = [Management.ManagementDateTimeConverter]::ToDateTime($t.Wmi.LastUseTime) } catch {} }
-        $acct = Get-AccountInfo $sid
-    }
+foreach ($p in $profiles) {
+    $ntReliable = $p.NTUSER -and -not $massTouched.ContainsKey($p.NTUSER.ToString('yyyyMMddHHmm'))
+    $ev = @()
+    if ($p.Sec)            { $ev += New-Object PSObject -Property @{ T = $p.Sec;            S = 'Security 4624' } }
+    if ($p.Lsm)            { $ev += New-Object PSObject -Property @{ T = $p.Lsm;            S = 'RDS logon/reconnect' } }
+    if ($p.RegLocalUnload) { $ev += New-Object PSObject -Property @{ T = $p.RegLocalUnload; S = 'Reg unload time' } }
+    if ($p.RegLocalLoad)   { $ev += New-Object PSObject -Property @{ T = $p.RegLocalLoad;   S = 'Reg load time' } }
+    if ($p.RegLoad)        { $ev += New-Object PSObject -Property @{ T = $p.RegLoad;        S = 'Reg load time' } }
+    if ($p.Recent)         { $ev += New-Object PSObject -Property @{ T = $p.Recent;         S = 'Recent items' } }
+    if ($p.UsrClass)       { $ev += New-Object PSObject -Property @{ T = $p.UsrClass;       S = 'UsrClass.dat' } }
+    if ($ntReliable)       { $ev += New-Object PSObject -Property @{ T = $p.NTUSER;         S = 'NTUSER.DAT' } }
+    $best = $ev | Sort-Object T -Descending | Select-Object -First 1
+    $days = if ($best) { [int]($now - $best.T).TotalDays } else { $null }
 
-    $size = if ($exists) { Get-DirSize $t.Path } else { New-Object PSObject -Property @{ Bytes = 0; Errors = 0 } }
+    $verdict =
+        if     ($p.Loaded)                 { 'KEEP - logged on now' }
+        elseif (-not $p.Exists)            { 'STALE - registry entry, folder missing' }
+        elseif (-not $p.Registered)        { 'ORPHAN - folder not registered in ProfileList' }
+        elseif (-not $best)                { 'REVIEW - no activity evidence found' }
+        elseif ($best.T -lt $cutoff)       { "CANDIDATE - inactive > $InactiveDays d" }
+        else                               { 'KEEP - active' }
 
-    # Candidate logic (report only)
-    $reasons = @()
-    if ($loaded)                                   { $reasons += 'IN USE (loaded)' }
-    if (-not $t.Wmi)                               { $reasons += 'Folder without profile registration' }
-    if ($t.Path -match '\.(TEMP|\d{3})$|TEMP\.')   { $reasons += 'Temp/duplicate profile' }
-    if ($acct.AccountState -like 'ORPHANED*' -or $acct.AccountState -eq 'Not found in AD') { $reasons += 'Account gone' }
-    if ($acct.AccountState -eq 'AD - DISABLED')    { $reasons += 'Account disabled' }
-    if (-not $lastAct -or $lastAct -lt $cutoff)    { $reasons += "Inactive > $InactiveDays d" }
-    if (-not $exists)                              { $reasons += 'Folder missing (stale registry entry)' }
-
-    $candidate = (-not $loaded) -and ($reasons | Where-Object { $_ -ne 'IN USE (loaded)' }).Count -gt 0
-
-    $results += [PSCustomObject][ordered]@{
-        ProfilePath       = $t.Path
-        Account           = $acct.Account
-        SID               = $sid
-        AccountState      = $acct.AccountState
-        Loaded            = $loaded
-        LastActivity      = $lastAct
-        DaysInactive      = $(if ($lastAct) { [int]($now - $lastAct).TotalDays } else { $null })
-        NTUSER_DAT        = $ntuser
-        UsrClass_DAT      = $usrclass
-        WMI_LastUseTime   = $wmiLast
-        AD_LastLogon_Any  = $acct.ADLastLogon
-        SizeGB            = [math]::Round($size.Bytes / 1GB, 3)
-        UnreadableFolders = $size.Errors
-        Candidate         = $candidate
-        Reasons           = ($reasons -join '; ')
+    $p | Add-Member NoteProperty Verdict $verdict
+    $rows += [PSCustomObject][ordered]@{
+        Folder             = $p.Folder
+        Account_FromLog    = $p.Account
+        SID                = $p.SID
+        Verdict            = $verdict
+        BestLastUse        = F $best.T
+        BestSource         = $best.S
+        DaysInactive       = $days
+        SizeGB             = $(if ($p.Size) { [math]::Round($p.Size.Bytes / 1GB, 3) } else { 0 })
+        Loaded             = $p.Loaded
+        Last_Security4624  = F $p.Sec
+        Last_RDSLogon      = F $p.Lsm
+        Reg_ProfileLoad    = F $p.RegLoad
+        Reg_LocalLoad      = F $p.RegLocalLoad
+        Reg_LocalUnload    = F $p.RegLocalUnload
+        Recent_Newest      = F $p.Recent
+        UsrClass_DAT       = F $p.UsrClass
+        NTUSER_DAT         = F $p.NTUSER
+        NTUSER_Reliable    = [bool]$ntReliable
+        RegKeyIsBak        = ($p.RegKey -like '*.bak')
+        UnreadableFolders  = $(if ($p.Size) { $p.Size.Errors } else { 0 })
+        ProfilePath        = $p.Path
     }
 }
-Write-Progress -Activity 'Scanning profiles (read-only)' -Completed
 
-# ---------- output ----------
-if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Path $OutDir | Out-Null }
-$csv = Join-Path $OutDir ("ProfileReport_{0}_{1:yyyyMMdd_HHmm}.csv" -f $env:COMPUTERNAME, $now)
-$results | Sort-Object SizeGB -Descending | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8
+# ---------------- 4. temp / cache scan ----------------
+# Advice: SAFE = cache/temp, app rebuilds it.  REVIEW = may contain user data or is costly to rebuild.
+$tempRules = @(
+    @{ Cat = 'User TEMP (older than TempAgeDays)'; Rel = 'AppData\Local\Temp';                                         Aged = $true;  Adv = 'SAFE' }
+    @{ Cat = 'IE / INetCache';                     Rel = 'AppData\Local\Microsoft\Windows\INetCache';                  Aged = $false; Adv = 'SAFE' }
+    @{ Cat = 'IE Temporary Internet Files';        Rel = 'AppData\Local\Microsoft\Windows\Temporary Internet Files';   Aged = $false; Adv = 'SAFE' }
+    @{ Cat = 'RDP client bitmap cache';            Rel = 'AppData\Local\Microsoft\Terminal Server Client\Cache';       Aged = $false; Adv = 'SAFE' }
+    @{ Cat = 'Windows Error Reporting';            Rel = 'AppData\Local\Microsoft\Windows\WER';                        Aged = $false; Adv = 'SAFE' }
+    @{ Cat = 'Crash dumps';                        Rel = 'AppData\Local\CrashDumps';                                   Aged = $false; Adv = 'SAFE' }
+    @{ Cat = 'Chrome cache';                       Rel = 'AppData\Local\Google\Chrome\User Data\*\Cache';              Aged = $false; Adv = 'SAFE' }
+    @{ Cat = 'Chrome code cache';                  Rel = 'AppData\Local\Google\Chrome\User Data\*\Code Cache';         Aged = $false; Adv = 'SAFE' }
+    @{ Cat = 'Edge cache';                         Rel = 'AppData\Local\Microsoft\Edge\User Data\*\Cache';             Aged = $false; Adv = 'SAFE' }
+    @{ Cat = 'Edge code cache';                    Rel = 'AppData\Local\Microsoft\Edge\User Data\*\Code Cache';        Aged = $false; Adv = 'SAFE' }
+    @{ Cat = 'Firefox cache';                      Rel = 'AppData\Local\Mozilla\Firefox\Profiles\*\cache2';            Aged = $false; Adv = 'SAFE' }
+    @{ Cat = 'Java cache';                         Rel = 'AppData\LocalLow\Sun\Java\Deployment\cache';                 Aged = $false; Adv = 'SAFE' }
+    @{ Cat = 'Downloads';                          Rel = 'Downloads';                                                  Aged = $false; Adv = 'REVIEW - user data' }
+    @{ Cat = 'Outlook OST cache';                  Rel = 'AppData\Local\Microsoft\Outlook';                            Aged = $false; Adv = 'REVIEW - rebuilds by re-download' }
+)
 
-$totalGB = ($results | Measure-Object SizeGB -Sum).Sum
-$cand    = @($results | Where-Object Candidate)
-$candGB  = ($cand | Measure-Object SizeGB -Sum).Sum
-$drive   = Get-WmiObject Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $profRoot.Substring(0,2))
+$tempRows = @(); $i = 0
+foreach ($p in ($profiles | Where-Object { $_.Exists })) {
+    $i++
+    Write-Progress -Activity 'Scanning temp/cache (read-only)' -Status $p.Path -PercentComplete ($i / $profiles.Count * 100)
+    foreach ($r in $tempRules) {
+        $full = Join-Path $p.Path $r.Rel
+        $dirs = if ($r.Rel -like '*`**') { @(Get-Item -Path $full -Force -ErrorAction SilentlyContinue) }
+                elseif ([IO.Directory]::Exists($full)) { @(Get-Item -LiteralPath $full -Force) } else { @() }
+        foreach ($d in $dirs) {
+            if (-not $d.PSIsContainer) { continue }
+            $older = if ($r.Aged) { $tempCut } else { [datetime]::MaxValue }
+            $st = Get-DirStats $d.FullName $older
+            if ($st.Bytes -eq 0) { continue }
+            $adv = $r.Adv
+            if ($p.Loaded -and $adv -eq 'SAFE') { $adv = 'SAFE after user logs off (logged on now)' }
+            $tempRows += [PSCustomObject][ordered]@{
+                Folder         = $p.Folder
+                ProfileVerdict = $p.Verdict
+                Category       = $r.Cat
+                Advice         = $adv
+                SizeMB         = [math]::Round($st.Bytes / 1MB, 1)
+                Files          = $st.Files
+                Path           = $d.FullName
+            }
+        }
+    }
+}
+Write-Progress -Activity 'Scanning temp/cache (read-only)' -Completed
+
+# ---------------- 5. output ----------------
+$csv1 = Join-Path $outDir "ProfileUsage_$($env:COMPUTERNAME)_$stamp.csv"
+$csv2 = Join-Path $outDir "ProfileTemp_$($env:COMPUTERNAME)_$stamp.csv"
+$rows     | Sort-Object SizeGB -Descending | Export-Csv -LiteralPath $csv1 -NoTypeInformation -Encoding UTF8 -Delimiter $Delimiter
+$tempRows | Sort-Object SizeMB -Descending | Export-Csv -LiteralPath $csv2 -NoTypeInformation -Encoding UTF8 -Delimiter $Delimiter
+
+function SumGB($set) { [math]::Round((($set | Measure-Object SizeGB -Sum).Sum), 2) }
+$cand   = @($rows | Where-Object { $_.Verdict -like 'CANDIDATE*' -or $_.Verdict -like 'ORPHAN*' })
+$review = @($rows | Where-Object { $_.Verdict -like 'REVIEW*' })
+$keep   = @($rows | Where-Object { $_.Verdict -like 'KEEP*' })
+$tempKeep = @($tempRows | Where-Object { $_.ProfileVerdict -like 'KEEP*' -and $_.Advice -like 'SAFE*' })
+$tempGB   = [math]::Round((($tempKeep | Measure-Object SizeMB -Sum).Sum) / 1024, 2)
+$drive    = Get-WmiObject Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $profRoot.Substring(0, 2))
 
 Write-Host ''
 Write-Host '===== PROFILE REPORT (read-only, nothing changed) =====' -ForegroundColor Cyan
-Write-Host ("Server            : {0}" -f $env:COMPUTERNAME)
-Write-Host ("Profile root      : {0}  (free {1:N1} GB of {2:N1} GB)" -f $profRoot, ($drive.FreeSpace/1GB), ($drive.Size/1GB))
-Write-Host ("Profiles scanned  : {0}  total {1:N2} GB" -f $results.Count, $totalGB)
-Write-Host ("In use (loaded)   : {0}" -f @($results | Where-Object Loaded).Count)
-Write-Host ("Cleanup candidates: {0}  -> potential savings {1:N2} GB" -f $cand.Count, $candGB) -ForegroundColor Yellow
-Write-Host ''
-$cand | Group-Object { ($_.Reasons -split '; ')[0] } |
-    Select-Object Name, Count, @{n='GB';e={[math]::Round(($_.Group | Measure-Object SizeGB -Sum).Sum,2)}} |
-    Sort-Object GB -Descending | Format-Table -AutoSize
-Write-Host 'Top 15 candidates by size:'
-$cand | Sort-Object SizeGB -Descending | Select-Object -First 15 Account, ProfilePath, DaysInactive, SizeGB, AccountState |
-    Format-Table -AutoSize
-Write-Host ("CSV: {0}" -f $csv) -ForegroundColor Green
-if (@($results | Where-Object { $_.UnreadableFolders -gt 0 }).Count) {
-    Write-Host 'Note: some subfolders were unreadable (ACL/long path) - sizes for those profiles may be slightly low.' -ForegroundColor DarkYellow
+Write-Host ("Server / root        : {0}  {1}  (free {2:N1} of {3:N1} GB)" -f $env:COMPUTERNAME, $profRoot, ($drive.FreeSpace / 1GB), ($drive.Size / 1GB))
+Write-Host ("Log coverage         : Security from {0} | RDS LSM from {1}" -f (F $secFrom), (F $lsmFrom))
+Write-Host ("Profiles             : {0}  total {1} GB  (logged on now: {2})" -f $rows.Count, (SumGB $rows), @($rows | Where-Object Loaded).Count)
+Write-Host ("A) Remove profiles   : {0} candidates/orphans -> {1} GB" -f $cand.Count, (SumGB $cand)) -ForegroundColor Yellow
+Write-Host ("   Review manually   : {0} with no activity evidence -> {1} GB" -f $review.Count, (SumGB $review))
+Write-Host ("B) Temp/cache (SAFE) : in {0} kept profiles -> {1} GB" -f $keep.Count, $tempGB) -ForegroundColor Yellow
+if ($massTouched.Count) {
+    Write-Host ("Note: NTUSER.DAT bulk-touched on {0} - ignored for those profiles." -f (($massTouched.Keys | ForEach-Object { "$_ ($($massTouched[$_])x)" }) -join ', ')) -ForegroundColor DarkYellow
 }
+Write-Host ''
+Write-Host 'Temp/cache by category (kept profiles):'
+$tempRows | Where-Object { $_.ProfileVerdict -like 'KEEP*' } | Group-Object Category, Advice |
+    Select-Object @{n = 'Category / Advice'; e = { $_.Name } }, Count, @{n = 'GB'; e = { [math]::Round((($_.Group | Measure-Object SizeMB -Sum).Sum) / 1024, 2) } } |
+    Sort-Object GB -Descending | Format-Table -AutoSize
+Write-Host 'Top 15 profile candidates:'
+$cand | Sort-Object SizeGB -Descending | Select-Object -First 15 Folder, BestLastUse, BestSource, DaysInactive, SizeGB |
+    Format-Table -AutoSize
+Write-Host "CSV: $csv1" -ForegroundColor Green
+Write-Host "CSV: $csv2" -ForegroundColor Green
